@@ -2,6 +2,13 @@
 
 #include <Arduino.h>
 
+#if __has_include("config_secrets.h")
+#include "config_secrets.h"
+#define HAS_LOCAL_SECRETS 1
+#else
+#define HAS_LOCAL_SECRETS 0
+#endif
+
 namespace Config {
 
 // Serial
@@ -9,8 +16,13 @@ constexpr unsigned long SERIAL_BAUD_RATE = 115200;
 
 // WiFi configuration
 // Om dessa lämnas tomma används endast sparade credentials från NVS.
-constexpr const char* WIFI_SSID = "The_Internet";
-constexpr const char* WIFI_PASSWORD = "ParlaStoya";
+#if HAS_LOCAL_SECRETS
+constexpr const char* WIFI_SSID = ConfigSecrets::WIFI_SSID;
+constexpr const char* WIFI_PASSWORD = ConfigSecrets::WIFI_PASSWORD;
+#else
+constexpr const char* WIFI_SSID = "";
+constexpr const char* WIFI_PASSWORD = "";
+#endif
 constexpr const char* WIFI_HOSTNAME = "Viltkyl_Arduino_ESP32";
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 constexpr uint16_t WEB_SERVER_PORT = 80;
