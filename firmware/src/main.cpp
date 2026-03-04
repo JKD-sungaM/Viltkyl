@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include "config.h"
+#include "network_manager.h"
+#include "web_server.h"
 
 // Applikationens huvudtillstånd.
 // Dessa används för att styra fläkt och knappbeteenden på ett tydligt sätt.
@@ -183,7 +185,15 @@ void handleTimedEvents(unsigned long nowMs) {
     Serial.print(Config::FAN_DEFAULT_PERCENT);
     Serial.print("% | fan_boost=");
     Serial.print(Config::FAN_BOOST_PERCENT);
-    Serial.println("%");
+    Serial.print("% | wifi=");
+
+    if (Network::isConnected()) {
+      Serial.print("connected");
+      Serial.print(" | ip=");
+      Serial.println(Network::getLocalIp());
+    } else {
+      Serial.println("disconnected");
+    }
   }
 }
 
@@ -195,6 +205,32 @@ void handleTimedEvents(unsigned long nowMs) {
 void setup() {
   Serial.begin(Config::SERIAL_BAUD_RATE);
   delay(1200);
+
+  // Initierar nätverksmodulen och försöker ansluta till lokalt WiFi.
+  // Prioritet:
+  // 1) Credentials i config.h (om satta) som även sparas i NVS
+  // 2) Tidigare sparade credentials i NVS
+  Network::initialize();
+
+  bool connected = false;
+
+  if (strlen(Config::WIFI_SSID) > 0) {
+    Serial.println("WiFi: forsoker ansluta med credentials fran config.h");
+    connected = Network::connectWithCredentials(
+        Config::WIFI_SSID,
+        Config::WIFI_PASSWORD,
+        true,
+        Config::WIFI_CONNECT_TIMEOUT_MS);
+  }
+
+  if (!connected) {
+    Serial.println("WiFi: forsoker ansluta med sparade credentials (NVS)");
+    connected = Network::connectUsingStoredCredentials(Config::WIFI_CONNECT_TIMEOUT_MS);
+  }
+
+  if (!connected) {
+    Serial.println("WiFi: ej ansluten. Fortsatter i offline-lage.");
+  }
 
   ledcSetup(
       Config::FAN_PWM_CHANNEL,
@@ -211,6 +247,13 @@ void setup() {
   Serial.println("Viltkyl: system init klar");
   Serial.println("State machine aktiv. Vantar pa START-knapp.");
   Serial.println("Knappfunktioner: Start=gron, Boost=bla, Stop=rod");
+
+  if (Network::isConnected()) {
+    Serial.print("WiFi status: ansluten, IP=");
+    Serial.println(Network::getLocalIp());
+  }
+
+  WebUi::initialize();
 }
 
 // Huvudloop:
@@ -218,6 +261,7 @@ void setup() {
 // - kör tidsstyrda event.
 void loop() {
   unsigned long nowMs = millis();
+  WebUi::handleClient();
   handleButtons(nowMs);
   handleTimedEvents(nowMs);
 }

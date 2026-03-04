@@ -7,6 +7,28 @@ namespace Config {
 // Serial
 constexpr unsigned long SERIAL_BAUD_RATE = 115200;
 
+// WiFi configuration
+// Om dessa lämnas tomma används endast sparade credentials från NVS.
+constexpr const char* WIFI_SSID = "The_Internet";
+constexpr const char* WIFI_PASSWORD = "ParlaStoya";
+constexpr const char* WIFI_HOSTNAME = "Viltkyl_Arduino_ESP32";
+constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
+constexpr uint16_t WEB_SERVER_PORT = 80;
+
+// Statisk IP-konfiguration
+// Sätt USE_STATIC_IP till true för att alltid använda en fast adress i ditt lokala nät.
+constexpr bool USE_STATIC_IP = true;
+constexpr const char* STATIC_IP = "192.168.1.200";
+constexpr const char* STATIC_GATEWAY = "192.168.1.1";
+constexpr const char* STATIC_SUBNET = "255.255.255.0";
+constexpr const char* STATIC_DNS1 = "8.8.8.8";
+constexpr const char* STATIC_DNS2 = "1.1.1.1";
+
+// Nätverkslagring i NVS
+constexpr const char* WIFI_NVS_NAMESPACE = "wifi";
+constexpr const char* WIFI_NVS_KEY_SSID = "ssid";
+constexpr const char* WIFI_NVS_KEY_PASSWORD = "password";
+
 // Fan PWM configuration
 constexpr uint8_t FAN_PWM_PIN = D6;
 constexpr uint8_t FAN_PWM_CHANNEL = 0;
