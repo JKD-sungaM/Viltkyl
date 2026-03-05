@@ -49,23 +49,27 @@ constexpr uint8_t FAN_PWM_RESOLUTION_BITS = 8;
 constexpr uint8_t FAN_DEFAULT_PERCENT = 20;
 constexpr uint8_t FAN_BOOST_PERCENT = 100;
 
-// Buttons (active low with internal pull-up)
-constexpr uint8_t BUTTON_START_PIN = D2;
-constexpr uint8_t BUTTON_BOOST_PIN = D3;
-constexpr uint8_t BUTTON_STOP_PIN = D4;
-constexpr bool BUTTON_ACTIVE_LOW = true;
-
 // Timing parameters
-constexpr unsigned long BUTTON_DEBOUNCE_MS = 35;
 constexpr unsigned long BOOST_DURATION_MS = 2UL * 60UL * 60UL * 1000UL;
-constexpr unsigned long BOOST_CANCEL_HOLD_MS = 2000;
-constexpr unsigned long SENSOR_READ_INTERVAL_MS = 2000;
+constexpr unsigned long SENSOR_READ_INTERVAL_MS = 2500;
+constexpr unsigned long DEGREE_DAY_SAMPLE_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long STATUS_LOG_INTERVAL_MS = 5000;
+
+// Sensor configuration
+// GPIO4 pa Nano ESP32 (motsvarar D20 i anvandarens kopplingsplan)
+constexpr uint8_t DHT22_DATA_PIN = D2;
+constexpr unsigned long DHT22_WARMUP_MS = 2500;
+constexpr bool DHT_DIAGNOSTIC_MODE = false;
+constexpr unsigned long DHT_DIAGNOSTIC_INTERVAL_MS = 2000;
+constexpr bool USE_FAKE_TEMPERATURE_DATA = false;
+constexpr float FAKE_TEMPERATURE_C = 10.0f;
+constexpr float FAKE_HUMIDITY_PERCENT = 55.0f;
 
 // Persistence
 // Dygnsgradsdata ska checkpointas var 5:e minut för att överleva omstart/strömavbrott.
 constexpr unsigned long PERSIST_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr const char* PERSIST_NAMESPACE = "viltkyl";
+constexpr const char* PERSIST_KEY_DEGREE_DAYS = "deg_days";
 constexpr uint16_t PERSIST_VERSION = 1;
 
 }  // namespace Config
