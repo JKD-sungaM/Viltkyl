@@ -52,14 +52,14 @@ constexpr uint8_t FAN_BOOST_PERCENT = 100;
 // Timing parameters
 constexpr unsigned long BOOST_DURATION_MS = 2UL * 60UL * 60UL * 1000UL;
 constexpr unsigned long SENSOR_READ_INTERVAL_MS = 2500;
-constexpr unsigned long DEGREE_DAY_SAMPLE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+constexpr unsigned long DEGREE_DAY_SAMPLE_INTERVAL_MS = 1UL * 60UL * 1000UL;
 constexpr unsigned long STATUS_LOG_INTERVAL_MS = 5000;
 
 // Sensor configuration
 // GPIO4 pa Nano ESP32 (motsvarar D20 i anvandarens kopplingsplan)
 constexpr uint8_t DHT22_DATA_PIN = D2;
 constexpr unsigned long DHT22_WARMUP_MS = 2500;
-constexpr bool DHT_DIAGNOSTIC_MODE = false;
+constexpr bool DHT_DIAGNOSTIC_MODE = false;                     //<--- Ta bort diagnostic mode
 constexpr unsigned long DHT_DIAGNOSTIC_INTERVAL_MS = 2000;
 constexpr bool USE_FAKE_TEMPERATURE_DATA = false;
 constexpr float FAKE_TEMPERATURE_C = 10.0f;
@@ -71,5 +71,9 @@ constexpr unsigned long PERSIST_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr const char* PERSIST_NAMESPACE = "viltkyl";
 constexpr const char* PERSIST_KEY_DEGREE_DAYS = "deg_days";
 constexpr uint16_t PERSIST_VERSION = 1;
+
+// GUI
+// Antal decimaler för visning av dygnsgrader i webbgranssnittet.
+constexpr uint8_t GUI_DEGREE_DAYS_DECIMALS = 3;
 
 }  // namespace Config
