@@ -11,7 +11,6 @@ struct SensorReading {
   float temperatureC;
   float humidityPercent;
   bool valid;
-  bool fakeData;
 };
 
 constexpr uint8_t DHT_READ_RETRIES = 3;
@@ -27,18 +26,10 @@ SensorReading tryReadFromDht() {
   float humidityPercent = g_dht.readHumidity();
   float temperatureC = g_dht.readTemperature();
   bool valid = !isnan(temperatureC) && !isnan(humidityPercent);
-  return SensorReading{temperatureC, humidityPercent, valid, false};
+  return SensorReading{temperatureC, humidityPercent, valid};
 }
 
 SensorReading readSensorData() {
-  if (Config::USE_FAKE_TEMPERATURE_DATA) {
-    return SensorReading{
-        Config::FAKE_TEMPERATURE_C,
-        Config::FAKE_HUMIDITY_PERCENT,
-        true,
-        true};
-  }
-
   for (uint8_t retry = 0; retry < DHT_READ_RETRIES; ++retry) {
     SensorReading reading = tryReadFromDht();
     if (reading.valid) {
@@ -56,7 +47,7 @@ SensorReading readSensorData() {
     g_consecutiveDhtFailures = 0;
   }
 
-  return SensorReading{0.0f, 0.0f, false, false};
+  return SensorReading{0.0f, 0.0f, false};
 }
 
 bool openPersistence() {
@@ -80,8 +71,12 @@ enum class AppState {
 
 // Global applikationsstatus.
 AppState currentState = AppState::IDLE;
-SensorReading latestSensorReading{0.0f, 0.0f, false, false};
+SensorReading latestSensorReading{0.0f, 0.0f, false};
 float degreeDays = 0.0f;
+uint32_t degreeTrackingSeconds = 0;
+unsigned long trackingAccumulatorMs = 0;
+unsigned long lastTrackingUpdateMs = 0;
+unsigned long lastTrackingPersistMs = 0;
 
 // Tidsstämplar för eventstyrning (boosttid, loggintervall, sensortick).
 unsigned long boostStartMs = 0;
@@ -126,9 +121,47 @@ void publishTelemetry() {
       latestSensorReading.temperatureC,
       latestSensorReading.humidityPercent,
       degreeDays,
-      latestSensorReading.valid,
-      latestSensorReading.fakeData};
+      degreeTrackingSeconds,
+      latestSensorReading.valid};
   WebUi::updateTelemetry(snapshot);
+}
+
+bool isRunningState(AppState state) {
+  return state == AppState::RUNNING_NORMAL || state == AppState::RUNNING_BOOST;
+}
+
+void persistTrackingIfNeeded(unsigned long nowMs, bool force) {
+  if (!force && (nowMs - lastTrackingPersistMs < Config::TRACKING_PERSIST_INTERVAL_MS)) {
+    return;
+  }
+
+  if (!openPersistence()) {
+    Serial.println("Persist: kunde inte oppna NVS");
+    return;
+  }
+
+  persistPreferences.putUInt(Config::PERSIST_KEY_DEGREE_TRACKING_SECONDS, degreeTrackingSeconds);
+  lastTrackingPersistMs = nowMs;
+}
+
+void updateDegreeTracking(unsigned long nowMs) {
+  if (lastTrackingUpdateMs == 0) {
+    lastTrackingUpdateMs = nowMs;
+    return;
+  }
+
+  const unsigned long deltaMs = nowMs - lastTrackingUpdateMs;
+  lastTrackingUpdateMs = nowMs;
+
+  if (!isRunningState(currentState)) {
+    return;
+  }
+
+  trackingAccumulatorMs += deltaMs;
+  if (trackingAccumulatorMs >= 1000UL) {
+    degreeTrackingSeconds += static_cast<uint32_t>(trackingAccumulatorMs / 1000UL);
+    trackingAccumulatorMs %= 1000UL;
+  }
 }
 
 void persistDegreeDaysIfNeeded(unsigned long nowMs, bool force) {
@@ -152,11 +185,17 @@ void clearPersistedDegreeDays() {
   }
 
   persistPreferences.remove(Config::PERSIST_KEY_DEGREE_DAYS);
+  persistPreferences.remove(Config::PERSIST_KEY_DEGREE_TRACKING_SECONDS);
 }
 
 void resetDegreeDays(const char* reason) {
+  const unsigned long nowMs = millis();
+  updateDegreeTracking(nowMs);
   degreeDays = 0.0f;
+  degreeTrackingSeconds = 0;
+  trackingAccumulatorMs = 0;
   clearPersistedDegreeDays();
+  lastTrackingPersistMs = nowMs;
   Serial.print("Dygnsgrader reset: ");
   Serial.println(reason);
 }
@@ -169,10 +208,17 @@ void loadPersistedDegreeDays() {
   }
 
   degreeDays = persistPreferences.getFloat(Config::PERSIST_KEY_DEGREE_DAYS, 0.0f);
+  degreeTrackingSeconds = persistPreferences.getUInt(Config::PERSIST_KEY_DEGREE_TRACKING_SECONDS, 0);
+  trackingAccumulatorMs = 0;
 
   if (degreeDays > 0.0f) {
     Serial.print("Persist: laddade dygnsgrader=");
     Serial.println(degreeDays, 2);
+  }
+
+  if (degreeTrackingSeconds > 0) {
+    Serial.print("Persist: laddad dygnsgrader-tid(s)=");
+    Serial.println(degreeTrackingSeconds);
   }
 }
 
@@ -190,6 +236,9 @@ void transitionTo(AppState newState, const char* reason) {
     return;
   }
 
+  const unsigned long nowMs = millis();
+  updateDegreeTracking(nowMs);
+
   currentState = newState;
 
   Serial.print("State => ");
@@ -200,6 +249,7 @@ void transitionTo(AppState newState, const char* reason) {
   switch (currentState) {
     case AppState::IDLE:
       setFanPercent(0);
+      persistTrackingIfNeeded(nowMs, true);
       break;
     case AppState::RUNNING_NORMAL:
       setFanPercent(Config::FAN_DEFAULT_PERCENT);
@@ -247,10 +297,13 @@ void handleSerialCommands() {
 
 // Hanterar tidsstyrda events:
 // - boost timeout
-// - periodisk sensorläsning (fake eller DHT22, Celsius)
+// - periodisk sensorläsning (DHT22, Celsius)
 // - dygnsgrader var 5:e minut
 // - periodisk statuslogg.
 void handleTimedEvents(unsigned long nowMs) {
+  updateDegreeTracking(nowMs);
+  persistTrackingIfNeeded(nowMs, false);
+
   if (currentState == AppState::RUNNING_BOOST &&
       (nowMs - boostStartMs >= Config::BOOST_DURATION_MS)) {
     transitionTo(AppState::RUNNING_NORMAL, "Boost timer elapsed");
@@ -268,8 +321,7 @@ void handleTimedEvents(unsigned long nowMs) {
       Serial.print(latestSensorReading.temperatureC, 1);
       Serial.print("C | Hum=");
       Serial.print(latestSensorReading.humidityPercent, 1);
-      Serial.print("% | source=");
-      Serial.println(latestSensorReading.fakeData ? "fake" : "dht22");
+      Serial.println("% | source=dht22");
     }
 
     publishTelemetry();
@@ -331,18 +383,6 @@ void setup() {
   Serial.begin(Config::SERIAL_BAUD_RATE);
   delay(1200);
 
-  if (Config::DHT_DIAGNOSTIC_MODE) {
-    pinMode(Config::DHT22_DATA_PIN, INPUT_PULLUP);
-    g_dht.begin();
-    Serial.println("DHT diagnostic mode aktiv (enkel temp/fukt-lasning var 2 sekund)");
-    Serial.print("[DHT-DIAG] Pin: ");
-    Serial.println(Config::DHT22_DATA_PIN);
-    Serial.print("[DHT-DIAG] Warmup ms: ");
-    Serial.println(Config::DHT22_WARMUP_MS);
-    delay(Config::DHT22_WARMUP_MS);
-    return;
-  }
-
   // Initierar nätverksmodulen och försöker ansluta till lokalt WiFi.
   // Prioritet:
   // 1) Credentials i config.h (om satta) som även sparas i NVS
@@ -378,16 +418,12 @@ void setup() {
 
   pinMode(Config::DHT22_DATA_PIN, INPUT_PULLUP);
   g_dht.begin();
-  Serial.print("Sensor mode: ");
-  Serial.println(Config::USE_FAKE_TEMPERATURE_DATA ? "fake data" : "DHT22");
+  Serial.println("Sensor mode: DHT22");
   Serial.print("DHT22 GPIO: ");
   Serial.println(Config::DHT22_DATA_PIN);
-
-  if (!Config::USE_FAKE_TEMPERATURE_DATA) {
-    Serial.print("DHT22 warmup ms=");
-    Serial.println(Config::DHT22_WARMUP_MS);
-    delay(Config::DHT22_WARMUP_MS);
-  }
+  Serial.print("DHT22 warmup ms=");
+  Serial.println(Config::DHT22_WARMUP_MS);
+  delay(Config::DHT22_WARMUP_MS);
 
   latestSensorReading = readSensorData();
   if (!latestSensorReading.valid) {
@@ -397,6 +433,8 @@ void setup() {
   loadPersistedDegreeDays();
   lastDegreeDaySampleMs = millis();
   lastPersistMs = millis();
+  lastTrackingUpdateMs = millis();
+  lastTrackingPersistMs = millis();
 
   Serial.println("Viltkyl: system init klar");
   Serial.println("State machine aktiv. Styrning via serial-kommandon.");
@@ -419,28 +457,6 @@ void setup() {
 
 // Huvudloop: kör serialstyrning och tidsstyrda event.
 void loop() {
-  if (Config::DHT_DIAGNOSTIC_MODE) {
-    static unsigned long lastDiagMs = 0;
-    const unsigned long nowMs = millis();
-    if (nowMs - lastDiagMs >= Config::DHT_DIAGNOSTIC_INTERVAL_MS) {
-      lastDiagMs = nowMs;
-
-      const float humidityPercent = g_dht.readHumidity();
-      const float temperatureC = g_dht.readTemperature();
-
-      if (isnan(temperatureC) || isnan(humidityPercent)) {
-        Serial.println("[DHT-DIAG] Read failed: NaN");
-      } else {
-        Serial.print("[DHT-DIAG] Temp=");
-        Serial.print(temperatureC, 1);
-        Serial.print("C | Hum=");
-        Serial.print(humidityPercent, 1);
-        Serial.println("%");
-      }
-    }
-    return;
-  }
-
   unsigned long nowMs = millis();
   WebUi::handleClient();
   handleSerialCommands();

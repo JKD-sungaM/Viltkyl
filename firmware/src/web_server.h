@@ -7,8 +7,8 @@ struct TelemetrySnapshot {
 	float temperatureC;
 	float humidityPercent;
 	float degreeDays;
+	unsigned long degreeTrackingSeconds;
 	bool sensorValid;
-	bool fakeData;
 };
 
 // Startar enkel webbserver om WiFi är anslutet.

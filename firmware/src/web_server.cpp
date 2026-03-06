@@ -12,11 +12,16 @@ namespace {
 
 WebServer server(Config::WEB_SERVER_PORT);
 bool serverStarted = false;
-WebUi::TelemetrySnapshot latestTelemetry{"IDLE", 0.0f, 0.0f, 0.0f, false, false};
+WebUi::TelemetrySnapshot latestTelemetry{"IDLE", 0.0f, 0.0f, 0.0f, 0, false};
 constexpr size_t DEGREE_HISTORY_CAPACITY = 240;
+constexpr float DEGREE_GOAL_DAYS = 40.0f;
+constexpr uint32_t ONE_HOUR_SECONDS = 3600;
 constexpr const char* HISTORY_KEY_COUNT = "hist_cnt";
 constexpr const char* HISTORY_KEY_LAST = "hist_last";
 constexpr const char* HISTORY_KEY_DATA = "hist_blob";
+constexpr const char* TRACKING_KEY_TOTAL = "trk_total";
+constexpr const char* TRACKING_KEY_LEGACY_OFFSET = "trk_secs";
+constexpr uint32_t TRACKING_PERSIST_INTERVAL_SECONDS = 10;
 constexpr size_t CLIMATE_HISTORY_CAPACITY = 150;
 constexpr uint32_t CLIMATE_HISTORY_MIN_INTERVAL_SECONDS = 60;
 constexpr const char* CLIMATE_KEY_COUNT = "env_cnt";
@@ -44,6 +49,112 @@ float lastRecordedDegreeDays = -1.0f;
 ClimatePoint climateHistory[CLIMATE_HISTORY_CAPACITY];
 size_t climateHistoryStart = 0;
 size_t climateHistoryCount = 0;
+uint32_t degreeTrackingAccumulatedSeconds = 0;
+uint32_t degreeTrackingRunStartSeconds = 0;
+bool degreeTrackingRunning = false;
+uint32_t lastTrackingPersistSeconds = 0;
+
+bool openWebPreferences();
+
+uint32_t getDegreeTrackingSeconds() {
+  uint32_t total = degreeTrackingAccumulatedSeconds;
+  if (degreeTrackingRunning) {
+    const uint32_t nowSeconds = millis() / 1000UL;
+    if (nowSeconds >= degreeTrackingRunStartSeconds) {
+      total += (nowSeconds - degreeTrackingRunStartSeconds);
+    }
+  }
+  return total;
+}
+
+void persistTrackingSeconds() {
+  if (!openWebPreferences()) {
+    return;
+  }
+
+  webPreferences.putUInt(TRACKING_KEY_TOTAL, getDegreeTrackingSeconds());
+  webPreferences.remove(TRACKING_KEY_LEGACY_OFFSET);
+}
+
+bool isTrackingStateRunning(const char* appState) {
+  if (appState == nullptr) {
+    return false;
+  }
+
+  return strcmp(appState, "RUNNING_NORMAL") == 0 || strcmp(appState, "RUNNING_BOOST") == 0;
+}
+
+void updateTrackingState(const char* appState) {
+  const bool shouldRun = isTrackingStateRunning(appState);
+  const uint32_t nowSeconds = millis() / 1000UL;
+
+  if (shouldRun && !degreeTrackingRunning) {
+    degreeTrackingRunStartSeconds = nowSeconds;
+    degreeTrackingRunning = true;
+    return;
+  }
+
+  if (!shouldRun && degreeTrackingRunning) {
+    if (nowSeconds >= degreeTrackingRunStartSeconds) {
+      degreeTrackingAccumulatedSeconds += (nowSeconds - degreeTrackingRunStartSeconds);
+    }
+    degreeTrackingRunStartSeconds = 0;
+    degreeTrackingRunning = false;
+    persistTrackingSeconds();
+    lastTrackingPersistSeconds = nowSeconds;
+  }
+}
+
+void maybePersistTrackingWhileRunning() {
+  if (!degreeTrackingRunning) {
+    return;
+  }
+
+  const uint32_t nowSeconds = millis() / 1000UL;
+  if (nowSeconds < lastTrackingPersistSeconds + TRACKING_PERSIST_INTERVAL_SECONDS) {
+    return;
+  }
+
+  persistTrackingSeconds();
+  lastTrackingPersistSeconds = nowSeconds;
+}
+
+float calculateAverageTemperatureLastHour(bool* hasValue) {
+  if (hasValue != nullptr) {
+    *hasValue = false;
+  }
+
+  if (climateHistoryCount == 0) {
+    return 0.0f;
+  }
+
+  const size_t newestIndex = (climateHistoryStart + climateHistoryCount - 1) % CLIMATE_HISTORY_CAPACITY;
+  const uint32_t newestTimestamp = climateHistory[newestIndex].uptimeSeconds;
+  const uint32_t lowerBound = newestTimestamp > ONE_HOUR_SECONDS ? newestTimestamp - ONE_HOUR_SECONDS : 0;
+
+  float sum = 0.0f;
+  size_t count = 0;
+
+  for (size_t i = 0; i < climateHistoryCount; ++i) {
+    const size_t ringIndex = (climateHistoryStart + i) % CLIMATE_HISTORY_CAPACITY;
+    const ClimatePoint& point = climateHistory[ringIndex];
+    if (point.uptimeSeconds < lowerBound) {
+      continue;
+    }
+
+    sum += point.temperatureC;
+    count++;
+  }
+
+  if (count == 0) {
+    return 0.0f;
+  }
+
+  if (hasValue != nullptr) {
+    *hasValue = true;
+  }
+  return sum / static_cast<float>(count);
+}
 
 bool openWebPreferences() {
   if (webPreferencesReady) {
@@ -75,6 +186,8 @@ void persistDegreeHistory() {
     Serial.print(" expected=");
     Serial.println(static_cast<unsigned long>(expectedBytes));
   }
+
+  persistTrackingSeconds();
 }
 
 void persistClimateHistory() {
@@ -103,6 +216,19 @@ void loadPersistedDegreeHistory() {
   if (!openWebPreferences()) {
     return;
   }
+
+  degreeTrackingAccumulatedSeconds = webPreferences.getUInt(TRACKING_KEY_TOTAL, 0);
+  if (degreeTrackingAccumulatedSeconds == 0) {
+    // Backward compatibility for older firmware that stored tracking in trk_secs.
+    degreeTrackingAccumulatedSeconds = webPreferences.getUInt(TRACKING_KEY_LEGACY_OFFSET, 0);
+    if (degreeTrackingAccumulatedSeconds > 0) {
+      webPreferences.putUInt(TRACKING_KEY_TOTAL, degreeTrackingAccumulatedSeconds);
+      webPreferences.remove(TRACKING_KEY_LEGACY_OFFSET);
+    }
+  }
+  degreeTrackingRunStartSeconds = 0;
+  degreeTrackingRunning = false;
+  lastTrackingPersistSeconds = millis() / 1000UL;
 
   uint32_t persistedCount = webPreferences.getUInt(HISTORY_KEY_COUNT, 0);
   if (persistedCount == 0) {
@@ -164,6 +290,10 @@ void clearPersistedDegreeHistory() {
   degreeHistoryStart = 0;
   degreeHistoryCount = 0;
   lastRecordedDegreeDays = -1.0f;
+  degreeTrackingAccumulatedSeconds = 0;
+  degreeTrackingRunStartSeconds = 0;
+  degreeTrackingRunning = false;
+  lastTrackingPersistSeconds = millis() / 1000UL;
 
   if (!openWebPreferences()) {
     return;
@@ -172,6 +302,8 @@ void clearPersistedDegreeHistory() {
   webPreferences.remove(HISTORY_KEY_COUNT);
   webPreferences.remove(HISTORY_KEY_LAST);
   webPreferences.remove(HISTORY_KEY_DATA);
+  webPreferences.remove(TRACKING_KEY_TOTAL);
+  webPreferences.remove(TRACKING_KEY_LEGACY_OFFSET);
 }
 
 void clearPersistedClimateHistory() {
@@ -250,21 +382,25 @@ void appendClimateHistory(float temperatureC, float humidityPercent) {
 String createTelemetryJson(bool includeHistory) {
   String json;
   json.reserve(includeHistory ? 24000 : 700);
+  const uint32_t degreeTrackingSeconds = static_cast<uint32_t>(latestTelemetry.degreeTrackingSeconds);
+  const float degreeDays = latestTelemetry.degreeDays;
+  const float remainingToGoal = degreeDays < DEGREE_GOAL_DAYS ? (DEGREE_GOAL_DAYS - degreeDays) : 0.0f;
+  const float overGoal = degreeDays > DEGREE_GOAL_DAYS ? (degreeDays - DEGREE_GOAL_DAYS) : 0.0f;
+  bool hasAvgTempLastHour = false;
+  float avgTempLastHour = calculateAverageTemperatureLastHour(&hasAvgTempLastHour);
 
-  uint32_t timelineNowSeconds = millis() / 1000UL;
-  if (degreeHistoryCount > 0) {
-    size_t lastIndex = (degreeHistoryStart + degreeHistoryCount - 1) % DEGREE_HISTORY_CAPACITY;
-    uint32_t historyNow = degreeHistory[lastIndex].uptimeSeconds;
-    if (timelineNowSeconds < historyNow) {
-      timelineNowSeconds = historyNow;
-    }
+  if (!hasAvgTempLastHour && latestTelemetry.sensorValid) {
+    avgTempLastHour = latestTelemetry.temperatureC;
+    hasAvgTempLastHour = true;
   }
 
-  uint32_t degreeTrackingSeconds = 0;
-  if (degreeHistoryCount > 0) {
-    const uint32_t trackingStart = degreeHistory[degreeHistoryStart].uptimeSeconds;
-    if (timelineNowSeconds >= trackingStart) {
-      degreeTrackingSeconds = timelineNowSeconds - trackingStart;
+  bool hasEtaSeconds = false;
+  uint32_t etaSeconds = 0;
+  if (remainingToGoal > 0.0f && hasAvgTempLastHour && avgTempLastHour > 0.01f) {
+    const float estimatedSeconds = (remainingToGoal * 24.0f * 60.0f * 60.0f) / avgTempLastHour;
+    if (estimatedSeconds > 0.0f) {
+      hasEtaSeconds = true;
+      etaSeconds = static_cast<uint32_t>(estimatedSeconds);
     }
   }
 
@@ -291,10 +427,18 @@ String createTelemetryJson(bool includeHistory) {
   json += latestTelemetry.sensorValid ? String(latestTelemetry.humidityPercent, 1) : String("null");
   json += ",\"sensorValid\":";
   json += latestTelemetry.sensorValid ? "true" : "false";
-  json += ",\"fakeData\":";
-  json += latestTelemetry.fakeData ? "true" : "false";
   json += ",\"degreeDays\":";
-  json += String(latestTelemetry.degreeDays, 2);
+  json += String(degreeDays, 2);
+  json += ",\"degreeGoal\":";
+  json += String(DEGREE_GOAL_DAYS, 0);
+  json += ",\"degreeDaysRemaining\":";
+  json += String(remainingToGoal, 2);
+  json += ",\"degreeDaysOverGoal\":";
+  json += String(overGoal, 2);
+  json += ",\"avgTempLastHourC\":";
+  json += hasAvgTempLastHour ? String(avgTempLastHour, 2) : String("null");
+  json += ",\"estimatedSecondsToGoal\":";
+  json += hasEtaSeconds ? String(etaSeconds) : String("null");
 
   if (includeHistory) {
     json += ",\"degreeDaysHistory\":[";
@@ -416,6 +560,30 @@ String createAliveHtml() {
       text-align: right;
     }
 
+    .degree-progress {
+      margin-top: 8px;
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      background: rgba(148, 163, 184, 0.2);
+      overflow: hidden;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .degree-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: #22c55e;
+      transition: width 180ms ease-out, background-color 180ms ease-out;
+    }
+
+    .degree-meta {
+      margin-top: 8px;
+      color: #94a3b8;
+      font-size: 0.84rem;
+    }
+
     .chart-wrap {
       width: 100%;
       height: 320px;
@@ -425,7 +593,6 @@ String createAliveHtml() {
       padding: 8px;
     }
 
-    #degreeChart,
     #climateChart {
       width: 100%;
       height: 100%;
@@ -435,13 +602,17 @@ String createAliveHtml() {
     #mantine-root {
       min-height: 1px;
     }
+
+    .chart-area-shade .recharts-area-area {
+      fill-opacity: 0.34 !important;
+    }
   </style>
 </head>
 <body>
   <main id="fallback-root" class="app-shell">
     <div class="head">
       <h1 style="margin:0; font-size:1.8rem;">Viltkyl Dashboard</h1>
-      <div class="muted">System/Miljo: 2s | Grafer: 1 min</div>
+      <div class="muted">Automatisk uppdatering var 2s</div>
     </div>
     <div class="grid">
       <section class="card system">
@@ -457,14 +628,11 @@ String createAliveHtml() {
         <div class="row"><span class="muted">Temp</span><span class="value" id="temp">-</span></div>
         <div class="row"><span class="muted">Luftfuktighet</span><span class="value" id="humidity">-</span></div>
         <div class="row"><span class="muted">Dygnsgrader</span><span class="value" id="degreeDays">-</span></div>
-      </section>
-      <section class="card chart">
-        <h2 style="margin-top:0;">Dygnsgrader - tillvaxt</h2>
-        <div class="muted" style="margin-bottom:8px;">Y-axel max 40 dygnsgrader</div>
-        <div class="chart-wrap">
-          <svg id="degreeChart" viewBox="0 0 560 260" preserveAspectRatio="none"></svg>
+        <div class="degree-progress" aria-label="Dygnsgrader progress mot 40">
+          <div class="degree-progress-fill" id="degreeProgressFill"></div>
         </div>
-        <div class="muted" id="source" style="margin-top:8px;">Kalla: -</div>
+        <div class="degree-meta" id="degreeGoalHelp">Mal: 40 dygnsgrader</div>
+        <div class="degree-meta" id="degreeEta">Beraknad tid till mal: -</div>
       </section>
       <section class="card chart">
         <h2 style="margin-top:0;">Temperatur och luftfuktighet over tid</h2>
@@ -472,6 +640,7 @@ String createAliveHtml() {
         <div class="chart-wrap">
           <svg id="climateChart" viewBox="0 0 560 260" preserveAspectRatio="none"></svg>
         </div>
+        <div class="muted" id="source" style="margin-top:8px;">Kalla: -</div>
       </section>
     </div>
   </main>
@@ -480,8 +649,7 @@ String createAliveHtml() {
   <script type="module">
     const hostName = '__HOSTNAME__';
     const degreeDaysDecimals = __DEGREE_DAYS_DECIMALS__;
-    const fastRefreshIntervalMs = 2000;
-    const chartRefreshIntervalMs = 60000;
+    const refreshIntervalMs = 2000;
     const fallbackRoot = document.getElementById('fallback-root');
     let mantineUiHealthy = false;
 
@@ -517,68 +685,14 @@ String createAliveHtml() {
       return hours + 'h ' + minutes + 'm ' + seconds + 's';
     }
 
-    function drawChart(history) {
-      const svg = document.getElementById('degreeChart');
-      if (!svg) {
-        return;
+    function formatAxisTime(totalSeconds) {
+      const sec = Math.max(0, Math.floor(Number(totalSeconds || 0)));
+      const hours = Math.floor(sec / 3600);
+      const minutes = Math.floor((sec % 3600) / 60);
+      if (hours > 0) {
+        return hours + 'h ' + minutes + 'm';
       }
-
-      const width = 560;
-      const height = 260;
-      const padding = { top: 16, right: 18, bottom: 40, left: 42 };
-      const innerW = width - padding.left - padding.right;
-      const innerH = height - padding.top - padding.bottom;
-      const maxY = 40;
-      const firstT = history.length > 0 ? Number(history[0].t || 0) : 0;
-      const lastT = history.length > 0 ? Number(history[history.length - 1].t || firstT) : firstT;
-      const rangeT = Math.max(1, lastT - firstT);
-
-      let accumulatedMax = 0;
-      const points = (history || []).map(function (p, index, arr) {
-        const x = arr.length <= 1 ? padding.left : padding.left + (index / (arr.length - 1)) * innerW;
-        const raw = Number(p.degreeDays || 0);
-        accumulatedMax = Math.max(accumulatedMax, raw);
-        const v = Math.max(0, Math.min(maxY, accumulatedMax));
-        const y = padding.top + (1 - v / maxY) * innerH;
-        return { x: x, y: y };
-      });
-
-      let markup = '';
-
-      for (let i = 0; i <= 4; i++) {
-        const y = padding.top + (i / 4) * innerH;
-        const yValue = Math.round(maxY - (i / 4) * maxY);
-        markup += '<line x1="' + padding.left + '" y1="' + y + '" x2="' + (width - padding.right) + '" y2="' + y + '" stroke="#334155" stroke-dasharray="4 4" />';
-        markup += '<text x="' + (padding.left - 8) + '" y="' + (y + 4) + '" text-anchor="end" font-size="11" fill="#94a3b8">' + yValue + '</text>';
-      }
-
-      markup += '<line x1="' + padding.left + '" y1="' + (height - padding.bottom) + '" x2="' + (width - padding.right) + '" y2="' + (height - padding.bottom) + '" stroke="#64748b" />';
-      markup += '<line x1="' + padding.left + '" y1="' + padding.top + '" x2="' + padding.left + '" y2="' + (height - padding.bottom) + '" stroke="#64748b" />';
-
-      for (let i = 0; i <= 4; i++) {
-        const frac = i / 4;
-        const x = padding.left + frac * innerW;
-        const t = firstT + frac * rangeT;
-        const h = t / 3600;
-        const label = h >= 10 ? h.toFixed(0) : h.toFixed(1);
-        markup += '<line x1="' + x + '" y1="' + (height - padding.bottom) + '" x2="' + x + '" y2="' + (height - padding.bottom + 5) + '" stroke="#64748b" />';
-        markup += '<text x="' + x + '" y="' + (height - 10) + '" text-anchor="middle" font-size="11" fill="#94a3b8">' + label + '</text>';
-      }
-
-      markup += '<text x="' + (padding.left + innerW / 2) + '" y="' + (height - 2) + '" text-anchor="middle" font-size="11" fill="#94a3b8">Tid (timmar)</text>';
-      markup += '<text x="14" y="' + (padding.top + innerH / 2) + '" text-anchor="middle" font-size="11" fill="#94a3b8" transform="rotate(-90 14 ' + (padding.top + innerH / 2) + ')">Dygnsgrader (0-40)</text>';
-
-      if (points.length > 0) {
-        const polyline = points.map(function (p) {
-          return p.x + ',' + p.y;
-        }).join(' ');
-        markup += '<polyline fill="none" stroke="#22d3ee" stroke-width="3" points="' + polyline + '" />';
-        if (points.length === 1) {
-          markup += '<circle cx="' + points[0].x + '" cy="' + points[0].y + '" r="4" fill="#22d3ee" />';
-        }
-      }
-
-      svg.innerHTML = markup;
+      return minutes + 'm';
     }
 
     function drawClimateChart(history) {
@@ -675,9 +789,42 @@ String createAliveHtml() {
       document.getElementById('uptime').textContent = formatUptime(data.uptimeSeconds);
       document.getElementById('degreeTracking').textContent = formatUptime(data.degreeTrackingSeconds || 0);
       document.getElementById('state').textContent = data.appState || '-';
-      document.getElementById('degreeDays').textContent = Number(data.degreeDays || 0).toFixed(degreeDaysDecimals);
+      const degreeDaysValue = Number(data.degreeDays || 0);
+      document.getElementById('degreeDays').textContent = degreeDaysValue.toFixed(degreeDaysDecimals);
       document.getElementById('temp').textContent = sensorValid ? Number(data.temperatureC).toFixed(2) + ' C' : 'Ingen giltig sensorlasning';
       document.getElementById('humidity').textContent = sensorValid ? Number(data.humidityPercent).toFixed(1) + ' %' : '-';
+      const progressFill = document.getElementById('degreeProgressFill');
+      const goalValue = Number(data.degreeGoal || 40);
+      const remainingValue = Number(data.degreeDaysRemaining || 0);
+      const overValue = Number(data.degreeDaysOverGoal || 0);
+      const avgTempLastHour = data.avgTempLastHourC;
+      const estimatedSeconds = data.estimatedSecondsToGoal;
+      if (progressFill) {
+        const progressValue = Math.min(100, (degreeDaysValue / goalValue) * 100);
+        progressFill.style.width = progressValue.toFixed(1) + '%';
+        progressFill.style.backgroundColor = degreeDaysValue > goalValue ? '#ef4444' : '#22c55e';
+      }
+
+      const goalHelp = document.getElementById('degreeGoalHelp');
+      if (goalHelp) {
+        if (overValue > 0.0) {
+          goalHelp.textContent = 'Mal: ' + goalValue.toFixed(0) + ' dygnsgrader | +' + overValue.toFixed(degreeDaysDecimals) + ' over mal';
+        } else {
+          goalHelp.textContent = 'Mal: ' + goalValue.toFixed(0) + ' dygnsgrader | ' + remainingValue.toFixed(degreeDaysDecimals) + ' kvar';
+        }
+      }
+
+      const etaText = document.getElementById('degreeEta');
+      if (etaText) {
+        if (remainingValue <= 0.0) {
+          etaText.textContent = 'Beraknad tid till mal: Mal uppnatt';
+        } else if (estimatedSeconds !== null && estimatedSeconds !== undefined) {
+          const avgText = avgTempLastHour !== null && avgTempLastHour !== undefined ? Number(avgTempLastHour).toFixed(2) + ' C' : '-';
+          etaText.textContent = 'Beraknad tid till mal: ' + formatUptime(estimatedSeconds) + ' (snittemp 1h: ' + avgText + ')';
+        } else {
+          etaText.textContent = 'Beraknad tid till mal: kan inte raknas ut (snittemp 1h <= 0)';
+        }
+      }
       document.getElementById('source').textContent = sourceText;
     }
 
@@ -686,16 +833,10 @@ String createAliveHtml() {
         return;
       }
 
-      drawChart(data.degreeDaysHistory || []);
       drawClimateChart(data.climateHistory || []);
     }
 
-    async function fetchLiveTelemetry() {
-      const response = await fetch('/health', { cache: 'no-store' });
-      return response.json();
-    }
-
-    async function fetchHistoryTelemetry() {
+    async function fetchTelemetry() {
       const response = await fetch('/api/telemetry', { cache: 'no-store' });
       return response.json();
     }
@@ -704,11 +845,12 @@ String createAliveHtml() {
     let mantineSetSourceText = null;
     let mantineDataCache = null;
 
-    async function refreshLive() {
+    async function refresh() {
       try {
-        const data = await fetchLiveTelemetry();
-        const sourceText = 'Kalla: ' + (data.fakeData ? 'fake' : 'DHT22');
+        const data = await fetchTelemetry();
+        const sourceText = 'Kalla: DHT22';
         updateFallbackLive(data, sourceText);
+        updateFallbackCharts(data);
 
         if (mantineSetData && mantineSetSourceText) {
           mantineDataCache = Object.assign({}, mantineDataCache || {}, data);
@@ -723,20 +865,6 @@ String createAliveHtml() {
         if (mantineSetSourceText) {
           mantineSetSourceText('Kalla: fel vid hamtning');
         }
-      }
-    }
-
-    async function refreshCharts() {
-      try {
-        const data = await fetchHistoryTelemetry();
-        updateFallbackCharts(data);
-
-        if (mantineSetData) {
-          mantineDataCache = Object.assign({}, mantineDataCache || {}, data);
-          mantineSetData(mantineDataCache);
-        }
-      } catch (error) {
-        // Lat live-panelerna fortsatta uppdatera aven om historik-anrop fallerar.
       }
     }
 
@@ -755,6 +883,7 @@ String createAliveHtml() {
           Title,
           Text,
           Badge,
+          Progress,
           Group,
           Grid,
           Stack,
@@ -789,20 +918,32 @@ String createAliveHtml() {
           const sensorValid = !!(data && data.sensorValid);
           const tempText = sensorValid ? Number(data.temperatureC).toFixed(2) + ' C' : 'Ingen giltig sensorlasning';
           const humidityText = sensorValid ? Number(data.humidityPercent).toFixed(1) + ' %' : '-';
-          const degreeDaysText = data ? Number(data.degreeDays || 0).toFixed(degreeDaysDecimals) : '-';
+          const degreeDaysValue = data ? Number(data.degreeDays || 0) : 0;
+          const degreeDaysText = data ? degreeDaysValue.toFixed(degreeDaysDecimals) : '-';
+          const degreeGoal = data ? Number(data.degreeGoal || 40) : 40;
+          const degreeOverGoal = data ? Number(data.degreeDaysOverGoal || 0) : 0;
+          const degreeRemaining = data ? Number(data.degreeDaysRemaining || 0) : 0;
+          const avgTempLastHour = data ? data.avgTempLastHourC : null;
+          const estimatedSeconds = data ? data.estimatedSecondsToGoal : null;
+          const degreeProgressValue = Math.min(100, (degreeDaysValue / degreeGoal) * 100);
+          const degreeProgressColor = degreeDaysValue > degreeGoal ? 'red.6' : 'green.6';
+          const degreeGoalHelpText = degreeOverGoal > 0
+            ? 'Mal: ' + degreeGoal.toFixed(0) + ' dygnsgrader | +' + degreeOverGoal.toFixed(degreeDaysDecimals) + ' over mal'
+            : 'Mal: ' + degreeGoal.toFixed(0) + ' dygnsgrader | ' + degreeRemaining.toFixed(degreeDaysDecimals) + ' kvar';
+          const degreeEtaText = degreeRemaining <= 0
+            ? 'Beraknad tid till mal: Mal uppnatt'
+            : (estimatedSeconds !== null && estimatedSeconds !== undefined
+              ? 'Beraknad tid till mal: ' + formatUptime(estimatedSeconds) + ' (snittemp 1h: ' + (avgTempLastHour !== null && avgTempLastHour !== undefined ? Number(avgTempLastHour).toFixed(2) : '-') + ' C)'
+              : 'Beraknad tid till mal: kan inte raknas ut (snittemp 1h <= 0)');
           const ipText = data && data.ip ? data.ip : 'Ej ansluten';
           const uptimeText = data ? formatUptime(data.uptimeSeconds) : '-';
           const degreeTrackingText = data ? formatUptime(data.degreeTrackingSeconds || 0) : '-';
           const stateText = data && data.appState ? data.appState : '-';
-          const degreeChartData = (data && data.degreeDaysHistory ? data.degreeDaysHistory : []).map(function (point) {
+          const climateSource = data && data.climateHistory ? data.climateHistory : [];
+          const climateStart = climateSource.length > 0 ? Number(climateSource[0].t || 0) : 0;
+          const climateChartData = climateSource.map(function (point) {
             return {
-              time: (Number(point.t || 0) / 3600).toFixed(1),
-              degreeDays: Number(point.degreeDays || 0)
-            };
-          });
-          const climateChartData = (data && data.climateHistory ? data.climateHistory : []).map(function (point) {
-            return {
-              time: (Number(point.t || 0) / 3600).toFixed(1),
+              elapsedSeconds: Math.max(0, Number(point.t || 0) - climateStart),
               temperatureC: Number(point.temperatureC || 0),
               humidityPercent: Number(point.humidityPercent || 0)
             };
@@ -818,7 +959,7 @@ String createAliveHtml() {
                 Group,
                 { justify: 'space-between', align: 'end', mb: 'md' },
                 React.createElement(Title, { order: 1, c: 'gray.0' }, 'Viltkyl Dashboard'),
-                React.createElement(Text, { size: 'sm', c: 'dimmed' }, 'System/Miljo: 2s | Grafer: 1 min')
+                React.createElement(Text, { size: 'sm', c: 'dimmed' }, 'Automatisk uppdatering var 2s')
               ),
               React.createElement(
                 Grid,
@@ -853,7 +994,15 @@ String createAliveHtml() {
                       { gap: 'xs' },
                       React.createElement(Group, { justify: 'space-between' }, React.createElement(Text, { c: 'dimmed' }, 'Temp'), React.createElement(Text, { fw: 700 }, tempText)),
                       React.createElement(Group, { justify: 'space-between' }, React.createElement(Text, { c: 'dimmed' }, 'Luftfuktighet'), React.createElement(Text, { fw: 700 }, humidityText)),
-                      React.createElement(Group, { justify: 'space-between' }, React.createElement(Text, { c: 'dimmed' }, 'Dygnsgrader'), React.createElement(Text, { fw: 700 }, degreeDaysText))
+                      React.createElement(Group, { justify: 'space-between' }, React.createElement(Text, { c: 'dimmed' }, 'Dygnsgrader'), React.createElement(Text, { fw: 700 }, degreeDaysText)),
+                      React.createElement('div', { style: { transform: 'scaleX(-1)' } }, React.createElement(Progress, {
+                        value: degreeProgressValue,
+                        color: degreeProgressColor,
+                        radius: 'xl',
+                        size: 'md'
+                      })),
+                      React.createElement(Text, { size: 'sm', c: 'dimmed' }, degreeGoalHelpText),
+                      React.createElement(Text, { size: 'sm', c: 'dimmed' }, degreeEtaText)
                     )
                   )
                 ),
@@ -863,20 +1012,29 @@ String createAliveHtml() {
                   React.createElement(
                     Paper,
                     { withBorder: true, radius: 'lg', p: 'md', bg: 'dark.7' },
-                    React.createElement(Title, { order: 3, mb: 6 }, 'Dygnsgrader - tillvaxt'),
-                    React.createElement(Text, { size: 'sm', c: 'dimmed', mb: 'sm' }, 'Y-axel max 40 dygnsgrader'),
-                    degreeChartData.length > 0 ? React.createElement(AreaChart, {
+                    React.createElement(Title, { order: 3, mb: 6 }, 'Temperatur och luftfuktighet over tid'),
+                    React.createElement(Text, { size: 'sm', c: 'dimmed', mb: 'sm' }, 'Cyan = temperatur (C), violet = luftfuktighet (%)'),
+                    climateChartData.length > 0 ? React.createElement(AreaChart, {
+                      className: 'chart-area-shade',
                       h: 300,
-                      data: degreeChartData,
-                      dataKey: 'time',
-                      withLegend: false,
+                      data: climateChartData,
+                      dataKey: 'elapsedSeconds',
+                      withLegend: true,
                       withDots: false,
                       withGradient: true,
                       curveType: 'monotone',
                       strokeWidth: 2,
                       gridAxis: 'xy',
-                      yAxisProps: { domain: [0, 40] },
-                      series: [{ name: 'degreeDays', color: 'cyan.5' }]
+                      xAxisProps: {
+                        type: 'number',
+                        domain: ['dataMin', 'dataMax'],
+                        tickFormatter: formatAxisTime,
+                        allowDuplicatedCategory: false
+                      },
+                      series: [
+                        { name: 'temperatureC', color: 'cyan.5', label: 'Temperatur (C)' },
+                        { name: 'humidityPercent', color: 'violet.5', label: 'Luftfuktighet (%)' }
+                      ]
                     }) : React.createElement(Text, { size: 'sm', c: 'dimmed' }, 'Ingen historik an laddad'),
                     React.createElement(
                       Group,
@@ -884,32 +1042,6 @@ String createAliveHtml() {
                       React.createElement(Text, { size: 'sm', c: 'dimmed' }, sourceText),
                       !data ? React.createElement(Group, { gap: 'xs' }, React.createElement(Loader, { size: 'xs' }), React.createElement(Text, { size: 'sm', c: 'dimmed' }, 'Laddar...')) : null
                     )
-                  )
-                )
-                ,
-                React.createElement(
-                  Grid.Col,
-                  { span: 12 },
-                  React.createElement(
-                    Paper,
-                    { withBorder: true, radius: 'lg', p: 'md', bg: 'dark.7' },
-                    React.createElement(Title, { order: 3, mb: 6 }, 'Temperatur och luftfuktighet over tid'),
-                    React.createElement(Text, { size: 'sm', c: 'dimmed', mb: 'sm' }, 'Cyan = temperatur (C), violet = luftfuktighet (%)'),
-                    climateChartData.length > 0 ? React.createElement(AreaChart, {
-                      h: 300,
-                      data: climateChartData,
-                      dataKey: 'time',
-                      withLegend: true,
-                      withDots: false,
-                      withGradient: true,
-                      curveType: 'monotone',
-                      strokeWidth: 2,
-                      gridAxis: 'xy',
-                      series: [
-                        { name: 'temperatureC', color: 'cyan.5', label: 'Temperatur (C)' },
-                        { name: 'humidityPercent', color: 'violet.5', label: 'Luftfuktighet (%)' }
-                      ]
-                    }) : React.createElement(Text, { size: 'sm', c: 'dimmed' }, 'Ingen historik an laddad')
                   )
                 )
               )
@@ -925,10 +1057,8 @@ String createAliveHtml() {
     }
 
     await mountMantineUi();
-    await refreshCharts();
-    await refreshLive();
-    setInterval(refreshLive, fastRefreshIntervalMs);
-    setInterval(refreshCharts, chartRefreshIntervalMs);
+    await refresh();
+    setInterval(refresh, refreshIntervalMs);
   </script>
 </body>
 </html>)HTML";
